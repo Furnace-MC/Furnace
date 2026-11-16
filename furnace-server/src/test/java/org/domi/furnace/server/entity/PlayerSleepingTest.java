@@ -1,0 +1,355 @@
+// 플레이어 잠 시험: 잘 수 있는 시각, 침대 쓰기(거리·막힘·괴물·낮), 잠 카운터와 깨기, 침대가 부서지면 깨기, 침대 폭발.
+package org.domi.furnace.server.entity;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import io.netty.channel.embedded.EmbeddedChannel;
+import org.domi.furnace.server.ConcurrentEmbeddedChannel;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.Consumer;
+import org.domi.furnace.server.block.B;
+import org.domi.furnace.server.block.BlockPlacementTest;
+import org.domi.furnace.server.block.Dir;
+import org.domi.furnace.server.block.Hit;
+import org.domi.furnace.server.block.InteractionResult;
+import org.domi.furnace.server.block.LevelServices;
+import org.domi.furnace.server.block.PlayerActor;
+import org.domi.furnace.server.block.Pos;
+import org.domi.furnace.server.world.BlockRegistry;
+import org.domi.furnace.server.world.DimensionType;
+import org.domi.furnace.server.world.GameMode;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+class PlayerSleepingTest {
+
+    @BeforeAll
+    static void install() {
+        org.domi.furnace.server.item.ItemContext.install(new org.domi.furnace.server.data.TagRegistries(
+                org.domi.furnace.server.net.registry.RegistrySet.load("registries/1.21.1.txt")));
+    }
+
+    static final BlockRegistry REG = BlockRegistry.load("blocks/1.21.1.txt");
+
+    static final class Lvl extends BlockPlacementTest.TestLevel {
+        long dayTime;
+        DimensionType type = DimensionType.OVERWORLD;
+        String dim;
+        Player player;
+        int sleepListUpdates;
+        org.domi.furnace.server.map.ExplorerMaps.Backend maps;
+        long gameTime;
+        final java.util.List<String> giftTables = new java.util.ArrayList<>();
+
+        @Override
+        protected LevelServices services() {
+            return new LevelServices.Delegating(LevelServices.DEFAULT) {
+                @Override public long dayTime() { return dayTime; }
+                @Override public long gameTime() { return gameTime; }
+                @Override public org.domi.furnace.server.map.ExplorerMaps.Backend explorerMaps() { return maps; }
+                @Override public String dimension() { return dim != null ? dim : type.levelKey(); }
+                @Override public DimensionType dimensionType() { return type; }
+                @Override public void forEachPlayer(Consumer<Player> c) { if (player != null) c.accept(player); }
+                @Override
+                public java.util.List<ItemStack> giftLoot(String table, org.domi.furnace.server.loot.LootEntity self, double x, double y, double z) {
+                    giftTables.add(table);
+                    return java.util.List.of(B.stack("minecraft:rabbit_hide", 1));
+                }
+            };
+        }
+
+        @Override public void updateSleepingPlayerList() { sleepListUpdates++; }
+
+        org.domi.furnace.server.plugin.GameEvents events = org.domi.furnace.server.plugin.GameEvents.NONE;
+
+        @Override public org.domi.furnace.server.plugin.GameEvents gameEvents() { return events; }
+    }
+
+    static final Pos FOOT = new Pos(0, -60, 0), HEAD = new Pos(0, -60, 1);
+
+    static void placeBed(Lvl level) {
+        level.setBlock(FOOT, REG.stateIdOrAir("minecraft:red_bed", Map.of("facing", "south", "part", "foot", "occupied", "false")), 3);
+        level.setBlock(HEAD, REG.stateIdOrAir("minecraft:red_bed", Map.of("facing", "south", "part", "head", "occupied", "false")), 3);
+    }
+
+    static Player player(Lvl level, double x, double y, double z) {
+        var p = new Player(7, UUID.randomUUID(), "Steve", new ConcurrentEmbeddedChannel());
+        p.vitals().env(new PlayerVitalsTest.TestEnv());
+        p.vitals().loadGameTypes(null, GameMode.SURVIVAL, false);
+        p.applyMove(x, y, z, 0, 0, true);
+        p.currentLevel = level;
+        level.player = p;
+        return p;
+    }
+
+    @Test
+    void sleepWindowMatchesVanillaClearWeather() {
+        var level = new Lvl();
+        // 맑은 날: 12542 부터 23459 까지 밤(skyDarken ≥ 4)
+        level.dayTime = 12541;
+        assertTrue(PlayerSleeping.isDay(level));
+        level.dayTime = 12542;
+        assertFalse(PlayerSleeping.isDay(level));
+        level.dayTime = 23459;
+        assertFalse(PlayerSleeping.isDay(level));
+        level.dayTime = 23460;
+        assertTrue(PlayerSleeping.isDay(level));
+        level.dayTime = 24000 + 13000;   // 다음 날도 같다
+        assertFalse(PlayerSleeping.isDay(level));
+        level.type = DimensionType.NETHER;   // 고정 시각 차원은 늘 낮이 아니다
+        assertFalse(PlayerSleeping.isDay(level));
+    }
+
+    @Test
+    void sleepsAtNightSetsSpawnAndOccupiesBed() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+        assertTrue(p.isSleeping());
+        assertEquals(HEAD, p.sleepingPos());
+        assertEquals(2, p.pose());
+        assertEquals(0.5, p.x(), 1e-9);
+        assertEquals(-60 + 0.6875, p.y(), 1e-9);
+        assertEquals(1.5, p.z(), 1e-9);
+        assertTrue(B.prop("occupied").is(level.getBlockState(HEAD)));
+        assertArrayEquals(new int[] {0, -60, 1}, p.vitals().respawnPos());
+        assertFalse(p.vitals().respawnForced());
+        assertEquals("minecraft:overworld", p.vitals().respawnDimension());
+        assertEquals(1, level.sleepListUpdates);
+        // 이미 자는 중이면 OTHER_PROBLEM(메시지 없음)
+        assertEquals(PlayerSleeping.Problem.OTHER_PROBLEM, PlayerSleeping.startSleepInBed(p, level, HEAD));
+        assertNull(PlayerSleeping.Problem.OTHER_PROBLEM.message());
+    }
+
+    /** 플러그인 PlayerBedEnterEvent 취소: 자지 않고 침대도 비어 있다(서버 주도라 되돌려 보낼 예측 없음). */
+    @Test
+    void bedEnterCancelLeavesPlayerAwakeAndBedFree() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        int[] asked = {0};
+        level.events = new org.domi.furnace.server.plugin.GameEvents() {
+            @Override public boolean playerBedEnter(Player p, String dimension, int x, int y, int z, int bedState) { asked[0]++; return false; }
+        };
+        var p = player(level, 1.5, -60, 0.5);
+        assertEquals(PlayerSleeping.Problem.OTHER_PROBLEM, PlayerSleeping.startSleepInBed(p, level, HEAD));
+        assertEquals(1, asked[0]);
+        assertFalse(p.isSleeping());
+        assertFalse(B.prop("occupied").is(level.getBlockState(HEAD)));
+        // 리스폰 지점은 바닐라·CraftBukkit 처럼 이벤트 앞 단계(낮에 눌러도 정해지는 곳)에서 이미 정해진다 — 취소와 무관
+        assertEquals(0, level.sleepListUpdates);
+    }
+
+    @Test
+    void problemsInVanillaOrder() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 1000;
+        var far = player(level, 5.0, -60, 0.5);
+        assertEquals(PlayerSleeping.Problem.TOO_FAR_AWAY, PlayerSleeping.startSleepInBed(far, level, HEAD));
+        assertNull(far.vitals().respawnPos(), "멀면 스폰 지점을 정하지 않는다");
+        // 낮: 스폰 지점은 정하고 no_sleep
+        var p = player(level, 1.5, -60, 0.5);
+        assertEquals(PlayerSleeping.Problem.NOT_POSSIBLE_NOW, PlayerSleeping.startSleepInBed(p, level, HEAD));
+        assertEquals("block.minecraft.bed.no_sleep", PlayerSleeping.Problem.NOT_POSSIBLE_NOW.messageKey());
+        assertArrayEquals(new int[] {0, -60, 1}, p.vitals().respawnPos());
+        assertFalse(p.isSleeping());
+        // 발 칸 위가 막히면 obstructed(범위 검사 다음)
+        level.setBlock(FOOT.above(), B.defaultState("minecraft:stone"), 3);
+        assertEquals(PlayerSleeping.Problem.OBSTRUCTED, PlayerSleeping.startSleepInBed(p, level, HEAD));
+        level.setBlock(FOOT.above(), B.defaultState("minecraft:air"), 3);
+        // natural 이 아닌 차원(네더·엔드)은 잘 수 없다 — 칸 높이는 그대로 두고 natural 만 끈 차원 종류
+        var o = DimensionType.OVERWORLD;
+        level.type = new DimensionType(o.levelKey(), o.typeKey(), o.minY(), o.height(), o.logicalHeight(), o.hasSkyLight(), o.hasCeiling(),
+                o.ultraWarm(), false, o.coordinateScale(), o.fixedTime(), o.bedWorks(), o.respawnAnchorWorks(), o.piglinSafe(), o.gen());
+        assertEquals(PlayerSleeping.Problem.NOT_POSSIBLE_HERE, PlayerSleeping.startSleepInBed(p, level, HEAD));
+    }
+
+    @Test
+    void nearbyMonsterPreventsSleepUnlessCreative() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 18000;
+        var z = new Zombie(level, level.nextEntityId());
+        z.moveTo(6.5, -60, 1.5, 0, 0);
+        level.addFreshEntity(z);
+        var p = player(level, 1.5, -60, 0.5);
+        assertEquals(PlayerSleeping.Problem.NOT_SAFE, PlayerSleeping.startSleepInBed(p, level, HEAD));
+        assertEquals("block.minecraft.bed.not_safe", PlayerSleeping.Problem.NOT_SAFE.messageKey());
+        p.vitals().loadGameTypes(null, GameMode.CREATIVE, false);
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+    }
+
+    @Test
+    void counterReachesHundredAndMorningWakes() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+        for (int i = 0; i < 99; i++) PlayerSleeping.tick(p, level);
+        assertFalse(p.isSleepingLongEnough());
+        PlayerSleeping.tick(p, level);
+        assertTrue(p.isSleepingLongEnough());
+        for (int i = 0; i < 20; i++) PlayerSleeping.tick(p, level);
+        assertEquals(100, p.sleepCounter(), "100 에서 멈춘다");
+        level.dayTime = 24000;
+        PlayerSleeping.tick(p, level);
+        assertFalse(p.isSleeping());
+        assertEquals(100, p.sleepCounter(), "자연스럽게 깨면 100");
+        assertFalse(B.prop("occupied").is(level.getBlockState(HEAD)));
+        assertEquals(0, p.pose());
+        // 일어선 자리: 침대 옆 칸 위(바닥 높이 0) — 침대 쪽을 본다
+        assertNotEquals(-60 + 0.6875, p.y());
+        for (int i = 0; i < 9; i++) PlayerSleeping.tick(p, level);
+        assertEquals(109, p.sleepCounter());
+        PlayerSleeping.tick(p, level);
+        assertEquals(0, p.sleepCounter(), "110 이 되면 0");
+    }
+
+    @Test
+    void brokenBedWakesImmediately() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+        for (int i = 0; i < 50; i++) PlayerSleeping.tick(p, level);
+        level.setBlock(HEAD, B.defaultState("minecraft:air"), 3);
+        PlayerSleeping.tick(p, level);
+        assertFalse(p.isSleeping());
+        assertEquals(0, p.sleepCounter(), "침대가 없어지면 바로 깨서 0");
+        // 침대가 없으면 자리를 옮기지 않는다(LivingEntity.stopSleeping 은 침대가 있을 때만 일어설 자리를 찾는다)
+        assertEquals(0.5, p.x(), 1e-9);
+        assertEquals(-60 + 0.6875, p.y(), 1e-9);
+        assertEquals(1.5, p.z(), 1e-9);
+    }
+
+    @Test
+    void stopSleepFacesTheBed() {
+        assertEquals(0.0F, PlayerSleeping.lookAtYaw(0.5, 0, -0.5, new Pos(0, 0, 0)), 1e-4, "남쪽(+z)을 보면 0");
+        assertEquals(90.0F, PlayerSleeping.lookAtYaw(1.5, 0, 0.5, new Pos(0, 0, 0)), 1e-4, "서쪽(-x)을 보면 90");
+        assertEquals(-180.0F, PlayerSleeping.lookAtYaw(0.5, 0, 1.5, new Pos(0, 0, 0)), 1e-4);
+    }
+
+    /** 자는 동안 소유 스레드가 떠 둔 일어설 자리(자는 중 접속 종료의 저장 위치)가 실제로 깼을 때 서는 자리와 같다. */
+    @Test
+    void standUpPositionIsCachedWhileSleepingAndMatchesWake() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        assertNull(p.sleepStandUp());
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+        double[] cached = p.sleepStandUp();
+        assertNotNull(cached, "잠들면 바로 떠 둔다");
+        assertEquals(4, cached.length);
+        assertNotEquals(0.5, cached[0], 1e-9, "침대 위(0.5, 0.6875, 0.5)가 아니라 옆 칸");
+        PlayerSleeping.stopSleepInBed(p, level, true, true);
+        assertEquals(cached[0], p.x(), 1e-9);
+        assertEquals(cached[1], p.y(), 1e-9);
+        assertEquals(cached[2], p.z(), 1e-9);
+        assertEquals(cached[3], p.yaw(), 1e-4);
+        assertNull(p.sleepStandUp(), "깨면 지운다");
+    }
+
+    /** 침대 곁에 벽을 세우면 일어설 자리가 바뀌고, 한 틱 갱신(1초마다)이 그걸 따라간다. */
+    @Test
+    void standUpPositionRefreshesOncePerSecond() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+        double[] before = p.sleepStandUp();
+        // 일어설 후보 칸(침대 양옆)을 모두 막는다 — 막힌 곳은 후보에서 빠져 다른 자리로
+        for (int dx : new int[] {-1, 1}) for (int dz : new int[] {0, 1}) {
+            level.setBlock(new Pos(dx, -60, dz), B.defaultState("minecraft:stone"), 3);
+            level.setBlock(new Pos(dx, -59, dz), B.defaultState("minecraft:stone"), 3);
+        }
+        level.gameTime = 20;
+        PlayerSleeping.tick(p, level);
+        double[] after = p.sleepStandUp();
+        assertNotNull(after);
+        assertFalse(java.util.Arrays.equals(before, after), "일어설 자리가 바뀌어 새로 떠 둔다");
+        PlayerSleeping.stopSleepInBed(p, level, true, true);
+        assertEquals(after[0], p.x(), 1e-9);
+        assertEquals(after[2], p.z(), 1e-9);
+    }
+
+    /** ServerPlayer.teleportTo(level, …): 자는 중 텔레포트는 먼저 깨운 뒤 목적지로 — 깨우기 보정이 목적지를 덮어쓰지 않는다. */
+    @Test
+    void teleportWakesSleepingPlayerBeforeMoving() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        var sent = new java.util.ArrayList<double[]>();
+        p.teleporter(sent::add);
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+        p.teleportTo(10.5, -60, 10.5, 90f, 0f);
+        p.drainOwnerTasks();   // 시험에는 소유 region 이 없어 소유 스레드 큐에 쌓인다
+        assertFalse(p.isSleeping());
+        assertFalse(B.prop("occupied").is(level.getBlockState(HEAD)), "침대 점유 해제");
+        assertNull(p.sleepStandUp());
+        assertFalse(sent.isEmpty());
+        double[] last = sent.get(sent.size() - 1);
+        assertEquals(10.5, last[0], 1e-9, "마지막 보정 텔레포트가 목적지");
+        assertEquals(10.5, last[2], 1e-9);
+        assertEquals(90.0, last[3], 1e-6);
+        // 깨우기 보정(일어선 자리)이 먼저 나갔다
+        assertTrue(sent.size() >= 2);
+        // 자지 않을 때는 곧바로(소유 스레드 큐 없이)
+        sent.clear();
+        p.teleportTo(1, -60, 1, 0f, 0f);
+        assertEquals(1, sent.size());
+    }
+
+    @Test
+    void relativeTeleportWakesAndAddsToStandUpPosition() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        var sent = new java.util.ArrayList<double[]>();
+        p.teleporter(sent::add);
+        assertNull(PlayerSleeping.startSleepInBed(p, level, HEAD));
+        p.teleportRelative(0, 5, 0);
+        p.drainOwnerTasks();
+        assertFalse(p.isSleeping());
+        double[] last = sent.get(sent.size() - 1);
+        assertEquals(8, last.length, "상대 텔레포트 형식");
+        assertEquals(p.y() + 5, last[1], 1e-9, "일어선 자리 기준");
+    }
+
+    @Test
+    void bedUseThroughBlockActorSleepsOrExplodesInNether() {
+        var level = new Lvl();
+        placeBed(level);
+        level.dayTime = 13000;
+        var p = player(level, 1.5, -60, 0.5);
+        var actor = new PlayerActor(p);
+        int foot = level.getBlockState(FOOT);
+        // 발 칸을 눌러도 머리 칸으로 잔다
+        assertEquals(InteractionResult.SUCCESS, B.behavior(foot).useWithoutItem(foot, level, FOOT, actor, new Hit(FOOT, Dir.UP, 0.5, -59.5, 0.5, false)));
+        assertTrue(p.isSleeping());
+        assertEquals(HEAD, p.sleepingPos());
+
+        var nether = new Lvl();
+        nether.dim = "minecraft:the_nether";   // BedBlock.canSetSpawn 은 차원 타입의 bedWorks 로 본다(칸 높이는 오버월드 그대로)
+        var ow = DimensionType.OVERWORLD;
+        nether.type = new DimensionType("minecraft:the_nether", "minecraft:the_nether", ow.minY(), ow.height(), ow.logicalHeight(), false, true, true,
+                false, 8.0, 18000L, false, true, true, org.domi.furnace.server.world.gen.NoiseWorldSource.Dimension.NETHER);
+        placeBed(nether);
+        var q = player(nether, 1.5, -60, 0.5);
+        int head = nether.getBlockState(HEAD);
+        assertEquals(InteractionResult.SUCCESS, B.behavior(head).useWithoutItem(head, nether, HEAD, new PlayerActor(q),
+                new Hit(HEAD, Dir.UP, 0.5, -59.5, 1.5, false)));
+        assertFalse(B.isTag(nether.getBlockState(HEAD), "minecraft:beds"), "두 칸 다 지운다");
+        assertFalse(B.isTag(nether.getBlockState(FOOT), "minecraft:beds"));
+        assertFalse(q.isSleeping());
+    }
+}

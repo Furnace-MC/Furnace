@@ -1,0 +1,48 @@
+package org.domi.furnace.server.world.gen.feature.foliage;
+
+import org.domi.furnace.server.world.gen.carver.WorldgenRandom;
+import org.domi.furnace.server.world.gen.feature.BlockPos;
+import org.domi.furnace.server.world.gen.feature.FeatureWorldView;
+import org.domi.furnace.server.world.gen.feature.TreeConfig;
+import org.domi.furnace.server.world.gen.feature.TreeIntProvider;
+import org.domi.furnace.server.world.gen.feature.trunk.TrunkPlacer;
+
+public final class SpruceFoliagePlacer extends FoliagePlacer {
+    private final TreeIntProvider trunkHeight;
+
+    public SpruceFoliagePlacer(TreeIntProvider radius, TreeIntProvider offset, TreeIntProvider trunkHeight) {
+        super(radius, offset);
+        this.trunkHeight = trunkHeight;
+    }
+
+    @Override
+    public int foliageHeight(WorldgenRandom random, int trunkHeight, TreeConfig config) {
+        return Math.max(4, trunkHeight - this.trunkHeight.sample(random));
+    }
+
+    @Override
+    protected void createFoliage(FeatureWorldView view, WorldgenRandom random, TreeConfig config, int trunkHeight,
+                                 TrunkPlacer.FoliageAttachment attachment, int foliageHeight, int foliageRadius, int offset,
+                                 java.util.List<BlockPos> leaves) {
+        int radius = random.nextInt(2);
+        int maxRadius = 1;
+        int extra = 0;
+        // 바닐라 SpruceFoliagePlacer: 아래 끝은 offset - foliageHeight가 아니라 -foliageHeight다(offset이 0이 아니면 맨 아래 줄이 더 있다).
+        for (int y = offset; y >= -foliageHeight; y--) {
+            placeLeavesRow(view, random, config, attachment.pos(), radius, y, attachment.doubleTrunk(), leaves);
+            if (radius >= maxRadius) {
+                radius = extra;
+                extra = 1;
+                maxRadius = Math.min(maxRadius + 1, foliageRadius + attachment.radiusOffset());
+            } else {
+                radius++;
+            }
+        }
+    }
+
+    // vanilla SpruceFoliagePlacer.shouldSkipLocation — 기본(블롭) 규칙과 달리 RNG를 소비하지 않는다.
+    @Override
+    protected boolean shouldSkipLocation(WorldgenRandom random, int absX, int y, int absZ, int radius, boolean giantTrunk) {
+        return absX == radius && absZ == radius && radius > 0;
+    }
+}

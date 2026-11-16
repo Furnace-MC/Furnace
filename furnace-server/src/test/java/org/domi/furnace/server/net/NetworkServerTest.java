@@ -1,0 +1,125 @@
+// NetworkServer가 설정 포트를 열어 TCP 연결을 수락하는지 검증
+package org.domi.furnace.server.net;
+
+import static org.junit.jupiter.api.Assertions.*;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import org.domi.furnace.server.entity.EntityIdAllocator;
+import org.domi.furnace.server.net.ChunkWorkerPool;
+import org.domi.furnace.server.sched.FurnaceSchedulerImpl;
+import org.domi.furnace.server.world.BlockRegistry;
+import org.domi.furnace.server.world.World;
+import org.domi.furnace.server.world.gen.SuperflatWorldSource;
+import org.junit.jupiter.api.Test;
+
+class NetworkServerTest {
+
+    @Test
+    void server_acceptsTcpConnection() throws Exception {
+        FurnaceSchedulerImpl sched = new FurnaceSchedulerImpl(50_000_000L);
+        BlockRegistry reg = BlockRegistry.load("blocks/1.21.1.txt");
+        World world = new World(new SuperflatWorldSource(reg, 0), new ChunkWorkerPool(1),
+                sched, sched.regionThreadCount(), 16, 2, 2, reg.directBits(), 7, java.util.concurrent.Executors.newSingleThreadExecutor());
+        NetworkServer server = new NetworkServer(0, -1, "Furnace Server", sched,
+                world, new EntityIdAllocator()); // port 0 = OS가 빈 포트 배정
+        int port = server.start();
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            assertTrue(s.isConnected());
+        } finally {
+            server.stop();
+            sched.close();
+        }
+    }
+
+    /** 포트가 점유되어 bind가 실패해도 Netty 이벤트 루프 스레드가 남아 JVM을 붙잡지 않아야 한다(체크 예외 BindException도 잡혀야). */
+    @Test
+    void bindFailure_shutsDownEventLoops() throws Exception {
+        FurnaceSchedulerImpl sched = new FurnaceSchedulerImpl(50_000_000L);
+        BlockRegistry reg = BlockRegistry.load("blocks/1.21.1.txt");
+        World world = new World(new SuperflatWorldSource(reg, 0), new ChunkWorkerPool(1),
+                sched, sched.regionThreadCount(), 16, 2, 2, reg.directBits(), 7, java.util.concurrent.Executors.newSingleThreadExecutor());
+        try (java.net.ServerSocket occupied = new java.net.ServerSocket(0)) {
+            NetworkServer server = new NetworkServer(occupied.getLocalPort(), -1, "Furnace Server", sched,
+                    world, new EntityIdAllocator());
+            Throwable thrown = assertThrows(Throwable.class, server::start);
+            // NIO 는 BindException, epoll 은 NativeIoException(IOException, "Address already in use")
+            assertTrue(thrown instanceof java.net.BindException
+                    || (thrown instanceof java.io.IOException && String.valueOf(thrown.getMessage()).contains("Address already in use")),
+                    "bind 실패 예외가 그대로 전달돼야: " + thrown);
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            long alive;
+            do {
+                alive = Thread.getAllStackTraces().keySet().stream()
+                        .filter(t -> (t.getName().startsWith("nioEventLoopGroup") || t.getName().startsWith("epollEventLoopGroup")) && t.isAlive()).count();
+                if (alive == 0) break;
+                Thread.sleep(50);
+            } while (System.nanoTime() < deadline);
+            assertEquals(0, alive, "bind 실패 후 이벤트 루프 스레드가 남아 있다");
+        } finally {
+            sched.close();
+        }
+    }
+
+    private NetworkServer newServer(FurnaceSchedulerImpl sched) {
+        BlockRegistry reg = BlockRegistry.load("blocks/1.21.1.txt");
+        World world = new World(new SuperflatWorldSource(reg, 0), new ChunkWorkerPool(1),
+                sched, sched.regionThreadCount(), 16, 2, 2, reg.directBits(), 7, java.util.concurrent.Executors.newSingleThreadExecutor());
+        return new NetworkServer(0, -1, "Furnace Server", sched, world, new EntityIdAllocator());
+    }
+
+    private static void writeFrame(java.io.OutputStream out, int id, java.util.function.Consumer<io.netty.buffer.ByteBuf> body) throws Exception {
+        io.netty.buffer.ByteBuf b = io.netty.buffer.Unpooled.buffer();
+        org.domi.furnace.server.net.io.Types.writeVarInt(b, id);
+        if (body != null) body.accept(b);
+        io.netty.buffer.ByteBuf f = io.netty.buffer.Unpooled.buffer();
+        org.domi.furnace.server.net.io.Types.writeVarInt(f, b.readableBytes());
+        f.writeBytes(b);
+        byte[] bytes = new byte[f.readableBytes()];
+        f.readBytes(bytes);
+        out.write(bytes);
+        out.flush();
+    }
+
+    /** 핸드셰이크 후 아무것도 안 보내는 소켓은 읽기 타임아웃으로 정리돼야 한다(유휴 소켓 영구 점유 방지). */
+    @Test
+    void idleSocket_isClosedByReadTimeout() throws Exception {
+        FurnaceSchedulerImpl sched = new FurnaceSchedulerImpl(50_000_000L);
+        NetworkServer server = newServer(sched);
+        server.readTimeoutSeconds(1);
+        int port = server.start();
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            s.setSoTimeout(5000);
+            assertEquals(-1, s.getInputStream().read(), "유휴 소켓이 타임아웃 후 닫혀야 한다");
+        } finally {
+            server.stop();
+            sched.close();
+        }
+    }
+
+    /** 서버 종료 시 접속 중인 연결은 사유 없이 끊기지 말고 Disconnect로 알려야 한다. */
+    @Test
+    void stop_kicksConnectedClientsWithReason() throws Exception {
+        FurnaceSchedulerImpl sched = new FurnaceSchedulerImpl(50_000_000L);
+        NetworkServer server = newServer(sched);
+        int port = server.start();
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            s.setSoTimeout(5000);
+            var out = s.getOutputStream();
+            writeFrame(out, 0x00, b -> { org.domi.furnace.server.net.io.Types.writeVarInt(b, 767);
+                org.domi.furnace.server.net.io.Types.writeString(b, "localhost"); b.writeShort(25565);
+                org.domi.furnace.server.net.io.Types.writeVarInt(b, 2); });
+            writeFrame(out, 0x00, b -> { org.domi.furnace.server.net.io.Types.writeString(b, "Tester");
+                org.domi.furnace.server.net.io.Types.writeUuid(b, new java.util.UUID(0, 0)); });
+            Thread.sleep(300);   // LoginSuccess가 도착할 시간
+            server.stop();
+            byte[] all = s.getInputStream().readAllBytes();
+            assertTrue(new String(all, java.nio.charset.StandardCharsets.ISO_8859_1).contains("multiplayer.disconnect.server_shutdown"),
+                    "종료 사유가 클라이언트에 전달돼야 한다");
+        } finally {
+            sched.close();
+        }
+    }
+}

@@ -1,0 +1,73 @@
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+.kotlin
+
+### IntelliJ IDEA ###
+.idea/modules.xml
+.idea/jarRepositories.xml
+.idea/compiler.xml
+.idea/libraries/
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### Mac OS ###
+.DS_Store
+# Furnace run artifacts
+furnace-run.log*
+furnace.properties
+
+### Furnace runtime data ###
+furnace-server/world/
+furnace-server/furnace.properties
+
+# worldgen-oracle 런타임 로그
+worldgen-oracle/logs/
+
+# 런타임 로그(서버/오라클)
+logs/
+
+
+### Mojang 산출물(EULA: 커밋 금지, 로컬 사본만 사용) ###
+tools/vanilla-data/*.jar
+tools/vanilla-data/libraries/
+tools/vanilla-data/versions/
+tools/vanilla-data/server-1.21.1/**/*.class
+
+### 서버 실행 산출물 ###
+/debug/
+/*/debug/
+
+# 로컬 JVM 옵션
+jvm.args
+
+# 서버 콘솔 명령 기록(JLine)
+.console_history

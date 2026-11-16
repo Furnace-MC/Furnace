@@ -1,0 +1,195 @@
+// 바닐라 worldgen JSON 리소스를 Gson으로 로드하는 데이터 접근 계층
+package org.domi.furnace.server.world.gen;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * 바닐라 worldgen JSON 을 클래스패스 리소스에서 지연 로드한다.
+ * 디렉토리 열거 대신 id 별 on-demand 로드 방식을 사용한다.
+ *
+ * 지원 경로:
+ *   density_function/<id-path>.json  (id = "minecraft:<id-path>")
+ *   noise/<name>.json                (id = "minecraft:<name>")
+ *   noise_settings/<name>.json       (id = "minecraft:<name>")
+ */
+public final class WorldgenData {
+
+    private final String basePath; // e.g. "worldgen/1.21.1"
+    private Map<String, Float> biomeTemperatures; // lazy-loaded
+
+    private WorldgenData(String basePath) {
+        this.basePath = basePath;
+    }
+
+    /**
+     * 지정된 basePath 를 사용하는 WorldgenData 인스턴스를 반환한다.
+     * 실제 로드는 각 메서드 호출 시 lazy 하게 수행된다.
+     */
+    public static WorldgenData load(String basePath) {
+        return new WorldgenData(basePath);
+    }
+
+    // ------------------------------------------------------------------
+    // Public accessors
+    // ------------------------------------------------------------------
+
+    /**
+     * 밀도 함수 JSON 을 반환한다.
+     * id 형식: "minecraft:overworld/base_3d_noise" → 파일 경로:
+     *   basePath/density_function/overworld/base_3d_noise.json
+     *
+     * 최상위 id (namespace 없는 경우) 도 허용:
+     *   "minecraft:shift_x" → density_function/shift_x.json
+     */
+    public JsonObject densityFunction(String id) {
+        String path = idToPath(id, "density_function");
+        JsonElement el = loadResource(path);
+        if (el == null) {
+            throw new IllegalArgumentException("Density function not found: " + id + " (path: " + path + ")");
+        }
+        return el.getAsJsonObject();
+    }
+
+    /**
+     * 노이즈 파라미터 JSON 을 반환한다.
+     * id 형식: "minecraft:continentalness" → basePath/noise/continentalness.json
+     */
+    public JsonElement noiseParams(String id) {
+        String path = idToPath(id, "noise");
+        JsonElement el = loadResource(path);
+        if (el == null) {
+            throw new IllegalArgumentException("Noise params not found: " + id + " (path: " + path + ")");
+        }
+        return el;
+    }
+
+    /**
+     * biome_parameters.json 배열을 반환한다.
+     * 파일 경로: basePath/biome_parameters.json
+     */
+    /** basePath 아래 JSON 배열 리소스(예: biome_parameters_nether.json). */
+    public JsonArray resourceArray(String name) {
+        JsonElement el = loadResource(basePath + "/" + name);
+        if (el == null) throw new IllegalStateException(name + " not found under " + basePath);
+        return el.getAsJsonArray();
+    }
+
+    public JsonArray biomeParameters() {
+        JsonElement el = loadResource(basePath + "/biome_parameters.json");
+        if (el == null) {
+            throw new IllegalStateException("biome_parameters.json not found: " + basePath + "/biome_parameters.json");
+        }
+        return el.getAsJsonArray();
+    }
+
+    /**
+     * noise_settings JSON 을 반환한다.
+     * id 형식: "minecraft:overworld" → basePath/noise_settings/overworld.json
+     */
+    public JsonObject noiseSettings(String id) {
+        String path = idToPath(id, "noise_settings");
+        JsonElement el = loadResource(path);
+        if (el == null) {
+            throw new IllegalArgumentException("Noise settings not found: " + id + " (path: " + path + ")");
+        }
+        return el.getAsJsonObject();
+    }
+
+    public JsonObject biome(String id) {
+        return jsonResource(idToPath(id, "worldgen/biome")).getAsJsonObject();
+    }
+
+    public JsonObject placedFeature(String id) {
+        return jsonResource(idToPath(id, "worldgen/placed_feature")).getAsJsonObject();
+    }
+
+    public JsonObject configuredFeature(String id) {
+        return jsonResource(idToPath(id, "worldgen/configured_feature")).getAsJsonObject();
+    }
+
+    public boolean hasConfiguredFeature(String id) {
+        return loadResource(idToPath(id, "worldgen/configured_feature")) != null;
+    }
+
+    public JsonObject structureSet(String id) {
+        String localPath = id.contains(":") ? id.substring(id.indexOf(':') + 1) : id;
+        return jsonResource(basePath + "/structure_set_" + localPath + ".json").getAsJsonObject();
+    }
+
+    public JsonElement jsonResource(String resourcePath) {
+        JsonElement el = loadResource(resourcePath);
+        if (el == null) throw new IllegalArgumentException("Worldgen resource not found: " + resourcePath);
+        return el;
+    }
+
+    /**
+     * 바이옴의 온도값을 반환한다. 기본값 0.5f.
+     * 파일 경로: basePath/biome_temperatures.json
+     */
+    public float biomeTemperature(String biomeName) {
+        if (biomeTemperatures == null) {
+            biomeTemperatures = loadBiomeTemperatures();
+        }
+        return biomeTemperatures.getOrDefault(biomeName, 0.5f);
+    }
+
+    /** biome의 temperature_modifier == "frozen" 여부(frozen_ocean, deep_frozen_ocean). */
+    public boolean biomeFrozenModifier(String biomeName) {
+        return frozenModifierCache.computeIfAbsent(biomeName, n -> {
+            // 플러그인 바이옴처럼 바닐라 JSON 이 없는 이름은 보정 없음(월드젠이 레지스트리 전체 이름을 훑는 곳이 있다)
+            JsonElement el = loadResource(idToPath(n, "worldgen/biome"));
+            if (el == null) return false;
+            JsonObject b = el.getAsJsonObject();
+            return b.has("temperature_modifier") && "frozen".equals(b.get("temperature_modifier").getAsString());
+        });
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> frozenModifierCache = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // ------------------------------------------------------------------
+    // Internals
+    // ------------------------------------------------------------------
+
+    /**
+     * "minecraft:overworld/base_3d_noise" → "worldgen/1.21.1/density_function/overworld/base_3d_noise.json"
+     * "minecraft:continentalness"         → "worldgen/1.21.1/noise/continentalness.json"
+     */
+    private String idToPath(String id, String subdir) {
+        // strip "minecraft:" namespace prefix if present
+        String localPath = id.contains(":") ? id.substring(id.indexOf(':') + 1) : id;
+        return basePath + "/" + subdir + "/" + localPath + ".json";
+    }
+
+    private Map<String, Float> loadBiomeTemperatures() {
+        JsonElement el = loadResource(basePath + "/biome_temperatures.json");
+        if (el == null) {
+            throw new IllegalStateException("biome_temperatures.json not found: " + basePath + "/biome_temperatures.json");
+        }
+        Map<String, Float> map = new HashMap<>();
+        for (var entry : el.getAsJsonObject().entrySet()) {
+            map.put(entry.getKey(), entry.getValue().getAsFloat());
+        }
+        return map;
+    }
+
+    private JsonElement loadResource(String resourcePath) {
+        ClassLoader cl = WorldgenData.class.getClassLoader();
+        InputStream is = cl.getResourceAsStream(resourcePath);
+        if (is == null) return null;
+        try (Reader reader = new InputStreamReader(is, StandardCharsets.UTF_8)) {
+            return JsonParser.parseReader(reader);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse resource: " + resourcePath, e);
+        }
+    }
+}
